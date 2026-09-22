@@ -1,12 +1,16 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import Flask, render_template, request, redirect, url_for, session, flash , jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3, os, uuid
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor 
 
 app = Flask(__name__)
 app.secret_key = 'study-sathi-secret-key-change-in-production'
 
 DB = 'study_sathi.db'
+
+#BACKGROUNG PROCESSING
+
+executor = ThreadPoolExecutor(max_workers=2)
 
 def get_db():
     conn = sqlite3.connect(DB)
@@ -43,6 +47,10 @@ def init_db():
             user_id TEXT NOT NULL,
             filename TEXT NOT NULL,
             original_name TEXT NOT NULL,
+            status TEXT DEFAULT 'processing',
+            extracted_text TEXT,
+            thumbnail_filename TEXT,
+            processsing_error TEXT,
             uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 CREATE TABLE IF NOT EXISTS messages (
@@ -57,6 +65,141 @@ CREATE TABLE IF NOT EXISTS messages (
     conn.close()
 
 @app.route('/')
+def extract_pdf_text(file_bytes):
+    from pypdf import PdfReader
+    pdf = pdfReader(io.BytesIO(file_bytes))
+text = [] 
+
+for page in pdf.pages:
+    text.append(page.extract_text() or "")
+return"\n".join (text)
+def generate_pdf_thumbnail(file_bytes):
+    import fitz
+    pdf = fitz.open(
+        stream = file_bytes,
+        filetype = "pdf"
+    )
+
+if pdf.page_count == 0:
+    pdf.close()
+    return none
+
+    page = pdf.load_page(0)
+
+pix = page.get_pixmap(
+matrix+fitz.matrix(1,2,1,2),
+alpha=false
+)
+image=pix.tobytes("png")
+pdf.close()
+return image
+
+def process_note(note_id):
+
+    try:
+        import boto3
+        conn=get_db()
+        note=conn.execute(
+            "SELECT * FROM notes WHERE id = ?",
+            (note_id, )
+           ).fetchone()
+        conn.close()
+        
+        if not note:
+        return
+
+    s3 = boto3.client(
+        's3',
+        region_name=os.environ.get('AWS_REGION'),
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key = environ.get('AWS_SECRET_ACCESS_KEY')
+    )
+bucket=os.environ.get('s3_BUCKET')
+file_object = io.BytesID()
+
+s3.download_fileobj(
+    bucket,
+    note['filename'],
+file_object
+)
+
+file_bytes=file_object.getvalue()
+extracted_text=""
+thumbnail_filename = None
+
+if note['original_name'].lower().endwith('.pdf'):
+
+    extracted_text=extract_pdf_text(
+        file_bytes
+    )
+thumbnial=generate_pdf_thumbnail(
+    file_bytes
+)
+
+if thumbnial:
+    thumbnail_filename = (
+        f"thumbnails/[note_id].png"
+    )
+
+    s3.upload_fileobj(
+        io.BytesIO(thumbnial),
+        bucket,
+        thumbnail_filename,
+        ExtraArgs={
+            "contentype": "image/png"
+        }
+    )
+
+elif note['orignal_name'].lower().endwith('.txt'):
+    extracted_text=file_bytes.decode(
+        'utf-8',
+        errors="ignore"
+    )
+
+    conn=get_dd()
+conn.execute(
+    """
+    UPDATE notes
+    SET
+    status=?
+    extracted_text=?
+    thumbnial_filename=?
+    processing_error=NULL
+    WHERE id =?
+    """
+    (
+        'completed',
+        extracted_text,
+        thumbnail_filename,
+        note_id
+
+    )
+)
+conn.commit()
+conn.close()
+print( f"Note{note_id}processing completed")
+except Exception as e :
+print( f"Note processing failed: {e}")
+conn=get_db()
+conn.execute(
+    """
+     UPDATE notes
+    SET
+    status=?
+    processing_error=?
+    WHERE id =?
+    """,
+    (
+        'failed',
+        str(e),
+        note_id
+)
+)
+conn.commit()
+conn.close()
+
+
+
 def index():
     if 'user_id' in session:
         return redirect(url_for('dashboard'))
@@ -181,10 +324,14 @@ def upload_note(group_id):
         return redirect(url_for('login'))
     file = request.files.get('file')
     if file and file.filename:
+        flash('select a file', 'error')
+        return redirect (url_for('group_detail',
+        group_id=group_id))
+       try:
         import boto3
         note_id = str(uuid.uuid4())
         filename = f"{note_id}_{file.filename}"
-        s3 = boto3.client('s3',
+        s3boto3.client('s3',
             region_name=os.environ.get('AWS_REGION'),
             aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
             aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY')
@@ -198,6 +345,16 @@ def upload_note(group_id):
         conn.close()
         flash('Note uploaded to S3!', 'success')
     return redirect(url_for('group_detail', group_id=group_id))
+
+@app.route('/note/<note_id>/status')
+def note_status(note_id):
+    db = get_db()
+    note = db.execute(
+        "SELECT id, orignal_name, status, thumbnial_filename FROM notes WHERE id=?",
+     (note_id,)
+    ).fetchone()
+    db.close( )
+    return jsonify(dict(note)) if note else jsonify(errors='Not Found'),404
 
 @app.route('/group/<group_id>/delete_note/<note_id>')
 def delete_note(group_id, note_id):

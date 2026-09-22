@@ -2,3 +2,6 @@ flask
 werkzeug
 boto3
 gunicorn
+pypdf
+PyMuPDF
+python-docx
